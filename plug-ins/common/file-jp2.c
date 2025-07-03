@@ -170,6 +170,152 @@ G_DEFINE_TYPE (Jp2, jp2, GIMP_TYPE_PLUG_IN)
 GIMP_MAIN (JP2_TYPE)
 DEFINE_STD_SET_I18N
 
+// WIP: Interactive preview. See jpeg-export.c for equivalent functionality there, which we're migrating here.
+typedef struct
+{
+  //struct jpeg_compress_struct cinfo;
+  //struct jpeg_error_mgr jerr;
+  gint          tile_height;
+  FILE         *outfile;
+  gboolean      has_alpha;
+  gint          rowstride;
+  guchar       *data;
+  guchar       *src;
+  GeglBuffer   *buffer;
+  const Babl   *format;
+  GFile        *file;
+  gboolean      abort_me;
+  guint         source_id;
+} PreviewPersistent;
+
+static GtkWidget         *preview_size  = NULL;
+static PreviewPersistent *prev_p        = NULL;
+GimpImage * volatile  preview_image = NULL;
+GimpLayer *           preview_layer = NULL;
+gboolean         separate_display   = false;
+void      destroy_preview(void);
+GimpDisplay     *display = NULL;
+gboolean         undo_touched      = FALSE;
+GimpDrawable    *drawable_global   = NULL;
+GimpImage       *orig_image_global = NULL;
+
+
+
+static void
+background_error_exit (void * cinfo)
+{
+  if (prev_p)
+    prev_p->abort_me = TRUE;
+ // (*cinfo->err->output_message) (cinfo);
+}
+
+static gboolean
+background_jpeg_save (PreviewPersistent *pp)
+{
+  gint yend;
+
+  if (pp->abort_me) // || (pp->cinfo.next_scanline >= pp->cinfo.image_height))
+    {
+      /* clean up... */
+      if (pp->abort_me)
+        {
+         // jpeg_abort_compress (&(pp->cinfo));
+        }
+      else
+        {
+         // jpeg_finish_compress (&(pp->cinfo));
+        }
+
+      fclose (pp->outfile);
+     // jpeg_destroy_compress (&(pp->cinfo));
+
+      g_free (pp->data);
+
+      if (pp->buffer)
+        g_object_unref (pp->buffer);
+
+      /* display the preview stuff */
+      if (! pp->abort_me)
+        {
+          GFileInfo *info;
+          gchar     *text;
+          GError    *error = NULL;
+
+          info = g_file_query_info (pp->file,
+                                    G_FILE_ATTRIBUTE_STANDARD_SIZE,
+                                    G_FILE_QUERY_INFO_NONE,
+                                    NULL, &error);
+
+          if (info)
+            {
+              goffset  size = g_file_info_get_attribute_uint64 (info, G_FILE_ATTRIBUTE_STANDARD_SIZE);
+              gchar   *size_text;
+
+              size_text = g_format_size (size);
+              text = g_strdup_printf (_("File size: %s"), size_text);
+              g_free (size_text);
+
+              g_object_unref (info);
+            }
+          else
+            {
+              text = g_strdup_printf (_("File size: %s"), error->message);
+              g_clear_error (&error);
+            }
+
+          gtk_label_set_text (GTK_LABEL (preview_size), text);
+          g_free (text);
+
+          /* and load the preview */
+          load_image (NULL, //procedure, 
+                          NULL, //G_OBJECT (config), 
+                           pp->file, OPJ_CODEC_J2K,
+                          OPJ_CLRSPC_SRGB, GIMP_RUN_NONINTERACTIVE,NULL, NULL);  // TODO: OPJ_CLRSPC_GRAY  
+                                        
+        }
+
+      /* we cleanup here (load_image doesn't run in the background) */
+      g_file_delete (pp->file, NULL, NULL);
+      g_object_unref (pp->file);
+
+      g_free (pp);
+      prev_p = NULL;
+
+      gimp_displays_flush ();
+      gdk_display_flush (gdk_display_get_default ());
+
+      return FALSE;
+    }
+  else
+    {
+      /* PORT_ME 
+      
+      if ((pp->cinfo.next_scanline % pp->tile_height) == 0)
+        {
+          yend = pp->cinfo.next_scanline + pp->tile_height;
+          yend = MIN (yend, pp->cinfo.image_height);
+       
+         gegl_buffer_get (pp->buffer,
+                           GEGL_RECTANGLE (0, pp->cinfo.next_scanline,
+                                           pp->cinfo.image_width,
+                                           (yend - pp->cinfo.next_scanline)),
+                           1.0,
+                           pp->format,
+                           pp->data,
+                           GEGL_AUTO_ROWSTRIDE,
+                           GEGL_ABYSS_NONE); 
+          pp->src = pp->data;
+        }
+
+      jpeg_write_scanlines (&(pp->cinfo), (JSAMPARRAY) &(pp->src), 1);
+      pp->src += pp->rowstride;
+*/
+      return TRUE;
+    }
+}
+
+// WIP: Interactive preview[END]
+
 
 static void
 jp2_class_init (Jp2Class *klass)
@@ -284,7 +430,7 @@ jp2_create_procedure (GimpPlugIn  *plug_in,
                                           "j2k,j2c,jpc");
       gimp_file_procedure_set_magics (GIMP_FILE_PROCEDURE (procedure),
                                       "0,string,\xff\x4f\xff\x51\x00");
-
+                                      
       gimp_procedure_add_choice_argument (procedure, "colorspace",
                                           _("Color s_pace"),
                                           _("Color space"),
@@ -314,6 +460,8 @@ jp2_create_procedure (GimpPlugIn  *plug_in,
                                         _("Exports files in JPEG 2000 file format"),
                                         _("Exports files in JPEG 2000 file format"),
                                         name);
+                                        
+                                               
       gimp_procedure_set_attribution (procedure,
                                       "Advance Software",
                                       "Advance Software",
@@ -335,6 +483,12 @@ jp2_create_procedure (GimpPlugIn  *plug_in,
                                           _("Quality of exported image"),
                                           0.0, 1.0, 0.9,
                                           G_PARAM_READWRITE);
+                                          
+       gimp_procedure_add_boolean_aux_argument (procedure, "show-preview",
+        _("Sho_w preview in image window"),
+        _("Creates a temporary layer with an export preview"),
+        FALSE,
+        G_PARAM_READWRITE);
 
       gimp_procedure_add_boolean_argument (procedure, "ict",
                                            _("IC_T compression"),
@@ -423,6 +577,12 @@ jp2_create_procedure (GimpPlugIn  *plug_in,
                                           _("Quality of exported image"),
                                           0.0, 1.0, 0.9,
                                           G_PARAM_READWRITE);
+                                                                   
+      gimp_procedure_add_boolean_aux_argument (procedure, "show-preview",
+        _("Sho_w preview in image window"),
+        _("Creates a temporary layer with an export preview"),
+        FALSE,
+        G_PARAM_READWRITE);
 
       gimp_procedure_add_boolean_argument (procedure, "ict",
                                            _("IC_T compression"),
@@ -1272,6 +1432,71 @@ open_dialog (GimpProcedure    *procedure,
   return color_space;
 }
 
+
+static void
+make_preview (GimpProcedureConfig *config)
+{
+  gboolean show_preview;
+
+  destroy_preview ();
+
+  g_object_get (config, "show-preview", &show_preview, NULL);
+
+  if (show_preview)
+    {
+      GFile *file = gimp_temp_file ("jpeg");
+
+      if (! undo_touched)
+        {
+          /* we freeze undo saving so that we can avoid sucking up
+           * tile cache with our unneeded preview steps. */
+          gimp_image_undo_freeze (preview_image);
+
+          undo_touched = TRUE;
+        }
+
+      export_image (file, orig_image_global,
+                    drawable_global,
+                    GIMP_RUN_NONINTERACTIVE, NULL, //GimpProcedure
+                     G_OBJECT(config), NULL);
+
+      g_object_unref (file);
+
+      if (separate_display && ! display)
+        display = gimp_display_new (preview_image);
+    }
+  else
+    {
+      gtk_label_set_text (GTK_LABEL (preview_size), _("File size: unknown"));
+
+      gimp_displays_flush ();
+    }
+}
+
+void
+destroy_preview (void)
+{
+  if (prev_p && !prev_p->abort_me)
+    {
+      guint id = prev_p->source_id;
+      prev_p->abort_me = TRUE;   /* signal the background save to stop */
+      background_jpeg_save (prev_p);
+      g_source_remove (id);
+    }
+
+  if (gimp_image_is_valid (preview_image) &&
+      gimp_item_is_valid (GIMP_ITEM (preview_layer)))
+    {
+      /* assuming that reference counting is working correctly, we do
+       * not need to delete the layer, removing it from the image
+       * should be sufficient
+       */
+      gimp_image_remove_layer (preview_image, preview_layer);
+
+      preview_layer = NULL;
+    }
+}
+
 static gboolean
 export_dialog (GimpProcedure         *procedure,
                GimpProcedureConfig   *config,
@@ -1290,7 +1515,7 @@ export_dialog (GimpProcedure         *procedure,
   gimp_procedure_dialog_get_spin_scale (GIMP_PROCEDURE_DIALOG (dialog),
                                         "quality", 100.0);
 
-  gimp_procedure_dialog_fill (GIMP_PROCEDURE_DIALOG (dialog), "quality", "ict",
+  gimp_procedure_dialog_fill (GIMP_PROCEDURE_DIALOG (dialog), "quality",  "show-preview", "ict",
                               NULL);
 
 #if ((OPJ_VERSION_MAJOR == 2 && OPJ_VERSION_MINOR == 5 && OPJ_VERSION_BUILD >= 3) || \
@@ -1335,6 +1560,8 @@ export_dialog (GimpProcedure         *procedure,
 
   run = gimp_procedure_dialog_run (GIMP_PROCEDURE_DIALOG (dialog));
   gtk_widget_destroy (dialog);
+  
+  destroy_preview();
 
   return run;
 }
